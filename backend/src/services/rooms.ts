@@ -1,6 +1,13 @@
+interface Participant {
+  peerId: string;
+  name: string;
+  isHost: boolean;
+}
+
 interface Room {
   hostId: string | null;
   peers: Set<string>;
+  participants: Map<string, Participant>; // peerId -> Participant
   pending: Map<string, string>;
   screenShareEnabled: boolean;
   recordingAllowed: Set<string>; // peer IDs с разрешением записи
@@ -17,6 +24,7 @@ export function createRoom(): string {
   rooms.set(code, {
     hostId: null,
     peers: new Set(),
+    participants: new Map(),
     pending: new Map(),
     screenShareEnabled: false,
     recordingAllowed: new Set(),
@@ -28,11 +36,12 @@ export function getRoom(code: string) {
   return rooms.get(code.toUpperCase()) || null;
 }
 
-export function setHost(code: string, peerId: string): boolean {
+export function setHost(code: string, peerId: string, name?: string): boolean {
   const room = rooms.get(code.toUpperCase());
   if (!room) return false;
   room.hostId = peerId;
   room.peers.add(peerId);
+  room.participants.set(peerId, { peerId, name: name || 'Хост', isHost: true });
   room.recordingAllowed.add(peerId); // хост всегда может записывать
   return true;
 }
@@ -47,8 +56,10 @@ export function requestJoin(code: string, peerId: string, name: string): boolean
 export function approveJoin(code: string, peerId: string): string[] | null {
   const room = rooms.get(code.toUpperCase());
   if (!room) return null;
+  const name = room.pending.get(peerId) || 'Участник';
   room.pending.delete(peerId);
   room.peers.add(peerId);
+  room.participants.set(peerId, { peerId, name, isHost: false });
   return Array.from(room.peers);
 }
 
@@ -69,6 +80,7 @@ export function leaveRoom(code: string, peerId: string): void {
   const room = rooms.get(code.toUpperCase());
   if (!room) return;
   room.peers.delete(peerId);
+  room.participants.delete(peerId);
   room.pending.delete(peerId);
   room.recordingAllowed.delete(peerId);
   if (room.hostId === peerId) {
@@ -76,6 +88,12 @@ export function leaveRoom(code: string, peerId: string): void {
   } else if (room.peers.size === 0) {
     rooms.delete(code.toUpperCase());
   }
+}
+
+export function getParticipants(code: string): Participant[] {
+  const room = rooms.get(code.toUpperCase());
+  if (!room) return [];
+  return Array.from(room.participants.values());
 }
 
 // Screen share

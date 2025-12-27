@@ -13,11 +13,14 @@ import { MicIcon, MicOffIcon, PhoneOffIcon, LinkIcon, ScreenIcon, RecordIcon } f
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5005';
 const PEER_HOST = process.env.NEXT_PUBLIC_PEER_HOST || 'localhost';
 const PEER_PORT = Number(process.env.NEXT_PUBLIC_PEER_PORT) || 5006;
+const PEER_SECURE = process.env.NEXT_PUBLIC_PEER_SECURE === 'true';
 
 type Status = 'setup' | 'waiting' | 'pending' | 'connected' | 'error';
 
 interface PendingUser { peerId: string; name: string; }
+interface Participant { peerId: string; name: string; isHost: boolean; }
 interface RoomSettings { screenShareEnabled: boolean; recordingAllowed: string[]; }
+interface PeerStatus { isMuted: boolean; audioLevel: number; }
 
 export default function RoomPage() {
   const params = useParams();
@@ -64,6 +67,8 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
   const [copied, setCopied] = useState(false);
   const [settings, setSettings] = useState<RoomSettings>({ screenShareEnabled: false, recordingAllowed: [] });
   const [myPeerId, setMyPeerId] = useState<string | null>(null);
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [peerStatuses, setPeerStatuses] = useState<Map<string, PeerStatus>>(new Map());
 
   // Screen share state
   const [isSharing, setIsSharing] = useState(false);
@@ -81,6 +86,9 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
   const pollRef = useRef<NodeJS.Timeout | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const connectedPeersRef = useRef<Set<string>>(new Set());
+  const dataConnectionsRef = useRef<Map<string, import('peerjs').DataConnection>>(new Map());
+  const audioAnalyzersRef = useRef<Map<string, { analyser: AnalyserNode; ctx: AudioContext }>>(new Map());
+  const audioLevelIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Memoized computed values
   const canRecord = useMemo(
@@ -111,6 +119,79 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
       if (res.ok) setSettings(await res.json());
     } catch {}
   }, [code]);
+
+  const fetchParticipants = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/rooms/${code}/participants`);
+      if (res.ok) {
+        const data = await res.json();
+        setParticipants(data.participants || []);
+      }
+    } catch {}
+  }, [code]);
+
+  // Setup audio analyzer for a remote stream
+  const setupAudioAnalyzer = useCallback((peerId: string, stream: MediaStream) => {
+    try {
+      const ctx = new AudioContext();
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      audioAnalyzersRef.current.set(peerId, { analyser, ctx });
+    } catch (e) {
+      console.error('Failed to setup audio analyzer:', e);
+    }
+  }, []);
+
+  // Cleanup audio analyzer
+  const cleanupAudioAnalyzer = useCallback((peerId: string) => {
+    const entry = audioAnalyzersRef.current.get(peerId);
+    if (entry) {
+      entry.ctx.close();
+      audioAnalyzersRef.current.delete(peerId);
+    }
+  }, []);
+
+  // Broadcast mute status to all peers
+  const broadcastMuteStatus = useCallback((isMuted: boolean) => {
+    dataConnectionsRef.current.forEach(conn => {
+      if (conn.open) {
+        conn.send({ type: 'mute-status', isMuted });
+      }
+    });
+  }, []);
+
+  // Handle incoming data from peers
+  const handlePeerData = useCallback((peerId: string, data: unknown) => {
+    if (typeof data === 'object' && data !== null && 'type' in data) {
+      const msg = data as { type: string; isMuted?: boolean };
+      if (msg.type === 'mute-status' && typeof msg.isMuted === 'boolean') {
+        setPeerStatuses(prev => {
+          const newMap = new Map(prev);
+          const existing = newMap.get(peerId) || { isMuted: false, audioLevel: 0 };
+          newMap.set(peerId, { ...existing, isMuted: msg.isMuted! });
+          return newMap;
+        });
+      }
+    }
+  }, []);
+
+  // Setup data connection with a peer
+  const setupDataConnection = useCallback((peerId: string) => {
+    if (!peerRef.current || dataConnectionsRef.current.has(peerId)) return;
+
+    const conn = peerRef.current.connect(peerId);
+    conn.on('open', () => {
+      dataConnectionsRef.current.set(peerId, conn);
+      // Send our current mute status
+      conn.send({ type: 'mute-status', isMuted: mic.isMuted });
+    });
+    conn.on('data', (data) => handlePeerData(peerId, data));
+    conn.on('close', () => {
+      dataConnectionsRef.current.delete(peerId);
+    });
+  }, [mic.isMuted, handlePeerData]);
 
   const toggleScreenSharePermission = useCallback(async () => {
     const newValue = !settings.screenShareEnabled;
@@ -178,6 +259,7 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
       remoteStreamsRef.current.set(call.peer, remoteStream);
       connectedPeersRef.current.add(call.peer);
       setPeersCount(connectedPeersRef.current.size);
+      setupAudioAnalyzer(call.peer, remoteStream);
 
       if (screenStreamRef.current) {
         sendScreenToPeer(call.peer, screenStreamRef.current);
@@ -190,11 +272,12 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
       remoteStreamsRef.current.delete(call.peer);
       connectedPeersRef.current.delete(call.peer);
       callsRef.current.delete(call.peer);
+      cleanupAudioAnalyzer(call.peer);
       setPeersCount(connectedPeersRef.current.size);
     });
 
     callsRef.current.set(call.peer, call);
-  }, [mic.stream, sendScreenToPeer]);
+  }, [mic.stream, sendScreenToPeer, setupAudioAnalyzer, cleanupAudioAnalyzer]);
 
   const handleCall = useCallback((call: MediaConnection) => {
     const metadata = call.metadata as { type?: string } | undefined;
@@ -218,6 +301,8 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
       remoteStreamsRef.current.set(peerId, remoteStream);
       connectedPeersRef.current.add(peerId);
       setPeersCount(connectedPeersRef.current.size);
+      setupAudioAnalyzer(peerId, remoteStream);
+      setupDataConnection(peerId);
     });
 
     call.on('close', () => {
@@ -226,11 +311,14 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
       remoteStreamsRef.current.delete(peerId);
       connectedPeersRef.current.delete(peerId);
       callsRef.current.delete(peerId);
+      cleanupAudioAnalyzer(peerId);
+      dataConnectionsRef.current.get(peerId)?.close();
+      dataConnectionsRef.current.delete(peerId);
       setPeersCount(connectedPeersRef.current.size);
     });
 
     callsRef.current.set(peerId, call);
-  }, [mic.stream]);
+  }, [mic.stream, setupAudioAnalyzer, cleanupAudioAnalyzer, setupDataConnection]);
 
   const approveUser = useCallback(async (peerId: string) => {
     await fetch(`${API_URL}/api/rooms/${code}/approve`, {
@@ -273,7 +361,21 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
     if (!mic.stream) { await mic.startMic(); return; }
     if (!isHost && !name.trim()) return;
 
-    const peer = new Peer({ host: PEER_HOST, port: PEER_PORT, path: '/peerjs', secure: false });
+    const peer = new Peer({
+      host: PEER_HOST,
+      port: PEER_PORT,
+      path: '/peerjs',
+      secure: PEER_SECURE,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'turn:eu-0.turn.peerjs.com:3478', username: 'peerjs', credential: 'peerjsp' },
+          { urls: 'turn:us-0.turn.peerjs.com:3478', username: 'peerjs', credential: 'peerjsp' },
+        ]
+      }
+    });
     peerRef.current = peer;
 
     peer.on('open', async (id) => {
@@ -282,14 +384,16 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
         await fetch(`${API_URL}/api/rooms/${code}/host`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ peerId: id }),
+          body: JSON.stringify({ peerId: id, name: 'Хост' }),
         });
         setStatus('waiting');
+        await fetchParticipants();
         pollRef.current = setInterval(async () => {
           const res = await fetch(`${API_URL}/api/rooms/${code}/pending`);
           const data = await res.json();
           setPendingUsers(data.pending);
           await fetchSettings();
+          await fetchParticipants();
         }, 2000);
       } else {
         await fetch(`${API_URL}/api/rooms/${code}/request`, {
@@ -306,7 +410,11 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
             setStatus('connected');
             setSettings({ screenShareEnabled: data.screenShareEnabled, recordingAllowed: data.recordingAllowed });
             data.peers.filter((p: string) => p !== id).forEach(callPeer);
-            pollRef.current = setInterval(fetchSettings, 3000);
+            setParticipants(data.participants || []);
+            pollRef.current = setInterval(async () => {
+              await fetchSettings();
+              await fetchParticipants();
+            }, 3000);
           }
         }, 2000);
       }
@@ -314,7 +422,7 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
 
     peer.on('call', handleCall);
     peer.on('error', () => { setError('Ошибка соединения'); setStatus('error'); });
-  }, [mic, isHost, name, code, fetchSettings, callPeer, handleCall]);
+  }, [mic, isHost, name, code, fetchSettings, fetchParticipants, callPeer, handleCall]);
 
   const toggleRecording = useCallback(() => {
     if (recorder.isRecording) {
@@ -340,10 +448,74 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
     router.push('/');
   }, [router]);
 
+  // Audio level monitoring
+  useEffect(() => {
+    if (status !== 'waiting' && status !== 'connected') return;
+
+    audioLevelIntervalRef.current = setInterval(() => {
+      const updates = new Map<string, PeerStatus>();
+
+      audioAnalyzersRef.current.forEach((entry, peerId) => {
+        const dataArray = new Uint8Array(entry.analyser.frequencyBinCount);
+        entry.analyser.getByteFrequencyData(dataArray);
+        const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+        const level = Math.min(100, Math.round(avg * 1.5));
+
+        const existing = peerStatuses.get(peerId) || { isMuted: false, audioLevel: 0 };
+        updates.set(peerId, { ...existing, audioLevel: level });
+      });
+
+      if (updates.size > 0) {
+        setPeerStatuses(prev => {
+          const newMap = new Map(prev);
+          updates.forEach((value, key) => newMap.set(key, value));
+          return newMap;
+        });
+      }
+    }, 100);
+
+    return () => {
+      if (audioLevelIntervalRef.current) {
+        clearInterval(audioLevelIntervalRef.current);
+      }
+    };
+  }, [status, peerStatuses]);
+
+  // Broadcast mute status when it changes
+  useEffect(() => {
+    broadcastMuteStatus(mic.isMuted);
+  }, [mic.isMuted, broadcastMuteStatus]);
+
+  // Handle incoming data connections
+  useEffect(() => {
+    if (!peerRef.current) return;
+
+    const handleConnection = (conn: import('peerjs').DataConnection) => {
+      conn.on('open', () => {
+        dataConnectionsRef.current.set(conn.peer, conn);
+        // Send our current mute status
+        conn.send({ type: 'mute-status', isMuted: mic.isMuted });
+      });
+      conn.on('data', (data) => handlePeerData(conn.peer, data));
+      conn.on('close', () => {
+        dataConnectionsRef.current.delete(conn.peer);
+      });
+    };
+
+    peerRef.current.on('connection', handleConnection);
+
+    return () => {
+      peerRef.current?.off('connection', handleConnection);
+    };
+  }, [mic.isMuted, handlePeerData]);
+
   // Cleanup on unmount
   useEffect(() => {
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
+      if (audioLevelIntervalRef.current) clearInterval(audioLevelIntervalRef.current);
+      audioAnalyzersRef.current.forEach(entry => entry.ctx.close());
+      dataConnectionsRef.current.forEach(conn => conn.close());
     };
   }, []);
 
@@ -445,6 +617,26 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
               </div>
             )}
 
+            {/* Participants list */}
+            {participants.length > 0 && (
+              <div className="bg-white/80 backdrop-blur-xl rounded-3xl shadow-xl p-6 space-y-3">
+                <p className="text-gray-500 text-sm font-medium">Участники ({participants.length})</p>
+                <div className="space-y-2">
+                  {participants.map(p => (
+                    <ParticipantRow
+                      key={p.peerId}
+                      participant={p}
+                      isMe={p.peerId === myPeerId}
+                      status={p.peerId === myPeerId
+                        ? { isMuted: mic.isMuted, audioLevel: mic.level }
+                        : peerStatuses.get(p.peerId)
+                      }
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Pending users */}
             {pendingUsers.length > 0 && (
               <div className="bg-white/80 backdrop-blur-xl rounded-3xl shadow-xl p-6 space-y-3">
@@ -518,6 +710,74 @@ const PendingUserRow = memo(function PendingUserRow({ user, onApprove, onReject 
           Нет
         </button>
       </div>
+    </div>
+  );
+});
+
+// Participant row component with avatar
+interface ParticipantRowProps {
+  participant: Participant;
+  isMe: boolean;
+  status?: PeerStatus;
+}
+
+const ParticipantRow = memo(function ParticipantRow({ participant, isMe, status }: ParticipantRowProps) {
+  const initials = useMemo(() => {
+    const parts = participant.name.trim().split(/\s+/);
+    if (parts.length >= 2) {
+      return (parts[0][0] + parts[1][0]).toUpperCase();
+    }
+    return participant.name.slice(0, 2).toUpperCase();
+  }, [participant.name]);
+
+  const bgColor = useMemo(() => {
+    const colors = [
+      'bg-blue-500', 'bg-green-500', 'bg-purple-500', 'bg-pink-500',
+      'bg-indigo-500', 'bg-teal-500', 'bg-orange-500', 'bg-cyan-500'
+    ];
+    let hash = 0;
+    for (let i = 0; i < participant.peerId.length; i++) {
+      hash = participant.peerId.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    return colors[Math.abs(hash) % colors.length];
+  }, [participant.peerId]);
+
+  const isSpeaking = status && !status.isMuted && status.audioLevel > 15;
+  const isMuted = status?.isMuted;
+
+  return (
+    <div className="flex items-center gap-3 py-1">
+      <div className="relative">
+        <div
+          className={`w-8 h-8 ${bgColor} rounded-full flex items-center justify-center text-white text-xs font-semibold transition-all ${
+            isSpeaking ? 'ring-2 ring-green-400 ring-offset-1' : ''
+          }`}
+        >
+          {initials}
+        </div>
+        {isMuted && (
+          <div className="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-red-500 rounded-full flex items-center justify-center">
+            <svg className="w-2.5 h-2.5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </div>
+        )}
+      </div>
+      <span className="text-gray-900 text-sm font-medium flex-1">
+        {participant.name}
+        {isMe && <span className="text-gray-400 ml-1">(вы)</span>}
+      </span>
+      {isSpeaking && (
+        <div className="flex gap-0.5 items-end h-4">
+          <div className="w-1 bg-green-500 rounded-full animate-pulse" style={{ height: '40%' }} />
+          <div className="w-1 bg-green-500 rounded-full animate-pulse" style={{ height: '70%', animationDelay: '0.1s' }} />
+          <div className="w-1 bg-green-500 rounded-full animate-pulse" style={{ height: '100%', animationDelay: '0.2s' }} />
+          <div className="w-1 bg-green-500 rounded-full animate-pulse" style={{ height: '60%', animationDelay: '0.3s' }} />
+        </div>
+      )}
+      {participant.isHost && (
+        <span className="text-xs text-[#007AFF] font-medium">Хост</span>
+      )}
     </div>
   );
 });
