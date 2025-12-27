@@ -9,6 +9,13 @@
 [![Next.js](https://img.shields.io/badge/Next.js-15-black)](https://nextjs.org/)
 [![Fastify](https://img.shields.io/badge/Fastify-5.0-white)](https://fastify.io/)
 
+[![Deploy Frontend to Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/pixelligue/zvonizvonu&project-name=zvonilka-frontend&root-directory=frontend)
+[![Deploy Backend to Railway](https://railway.app/button.svg)](https://railway.app/template?code=zvonilka&referralCode=zvonilka)
+
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-❤-ea4aaa?logo=github)](https://github.com/sponsors/pixelligue)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-Buy%20me%20a%20coffee-ff5e5b?logo=ko-fi)](https://ko-fi.com/pixelligue)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pixelligue)
+
 [Демо](#демо) • [Возможности](#возможности) • [Установка](#установка) • [Архитектура](#архитектура) • [API](#api)
 
 </div>
