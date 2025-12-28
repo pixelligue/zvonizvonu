@@ -249,12 +249,21 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
 
   const handleAudioCall = useCallback((call: MediaConnection) => {
     if (!mic.stream) return;
+
+    // Prevent duplicate connections - if we already have a call to this peer, ignore incoming
+    if (callsRef.current.has(call.peer)) {
+      console.log('Already have connection to', call.peer, '- ignoring incoming call');
+      return;
+    }
+
     call.answer(mic.stream);
 
     call.on('stream', (remoteStream) => {
       const audio = new Audio();
       audio.srcObject = remoteStream;
       audio.autoplay = true;
+      // Explicitly play to handle browsers that block autoplay
+      audio.play().catch(e => console.warn('Audio autoplay blocked:', e));
       audioRefs.current.set(call.peer, audio);
       remoteStreamsRef.current.set(call.peer, remoteStream);
       connectedPeersRef.current.add(call.peer);
@@ -291,12 +300,22 @@ function MeshRoom({ code, isHost }: { code: string; isHost: boolean }) {
   const callPeer = useCallback((peerId: string) => {
     if (!peerRef.current || !mic.stream || callsRef.current.has(peerId)) return;
 
+    const myId = peerRef.current.id;
+    // Deterministic ordering: only the peer with the "smaller" ID initiates the call
+    // This prevents race conditions where both peers try to call each other
+    if (myId > peerId) {
+      console.log('Skipping call to', peerId, '- they should call us (deterministic ordering)');
+      return;
+    }
+
     const call = peerRef.current.call(peerId, mic.stream, { metadata: { type: 'audio' } });
 
     call.on('stream', (remoteStream) => {
       const audio = new Audio();
       audio.srcObject = remoteStream;
       audio.autoplay = true;
+      // Explicitly play to handle browsers that block autoplay
+      audio.play().catch(e => console.warn('Audio autoplay blocked:', e));
       audioRefs.current.set(peerId, audio);
       remoteStreamsRef.current.set(peerId, remoteStream);
       connectedPeersRef.current.add(peerId);
